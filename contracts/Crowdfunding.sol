@@ -5,9 +5,9 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract Crowdfunding is Ownable{
     uint256 public campaignId;
-    uint256 ratio;
-    address tokenCF;
-    mapping(uint256 => Campaign) idToCampaign;
+    uint256 public ratio;
+    address public tokenCF;
+    mapping(uint256 => Campaign) public idToCampaign;
     mapping(uint256 => mapping(address => uint256)) backerToContribution; 
 
     struct Campaign {
@@ -18,6 +18,7 @@ contract Crowdfunding is Ownable{
         uint256 vestingPeriod;
         uint256 totalAmount; // Total amount of contributions
         bool claim; // To know did the creator claim all contributions.
+        bool status; // To know does the campaign active 
     }
 
     /**
@@ -37,7 +38,7 @@ contract Crowdfunding is Ownable{
     event ContributionsClaimed(uint256 campaignId, address creator, uint256 amount);
     event ContributionsRefunded(uint256 campaignId, address backer, uint256 amount);
     
-
+    // To protect Reentrancy attack
     bool locked;
     modifier noReentrancy {
         require(!locked, "Crowdfunding: No reentrancy!");
@@ -63,10 +64,11 @@ contract Crowdfunding is Ownable{
             msg.sender,
             block.timestamp + _vestingPeriod,
             0,
+            false,
             false
         );
 
-        emit CampaignCreated(campaignId, _name, msg.sender, _targetAmount, _vestingPeriod);
+        emit CampaignCreated(campaignId, _name, msg.sender, _targetAmount, block.timestamp + _vestingPeriod);
     }
 
     /**
@@ -77,7 +79,8 @@ contract Crowdfunding is Ownable{
     function contributeToCampaign(uint256 _campId, uint256 _sum) external payable noReentrancy {
         require(_campId <= campaignId, "Crowdfunding: Invalid campaign id!");
         Campaign memory camp = idToCampaign[_campId];
-        require(camp.vestingPeriod <= block.timestamp, "Crowdfunding: Vesting period already over!");
+        require(!camp.status, "Crowdfunding: Campaign already over!");
+        require(block.timestamp < camp.vestingPeriod, "Crowdfunding: Vesting period already over!");
 
         if(msg.value > _sum) {
             (bool success,) = payable(msg.sender).call{value: msg.value - _sum}("");
@@ -86,7 +89,16 @@ contract Crowdfunding is Ownable{
             _sum = msg.value;
         }
 
-        require(camp.totalAmount + _sum <= camp.targetAmount, "Crowdfunding: Invalid sum!");
+        if(_sum + camp.totalAmount >= camp.targetAmount) {
+            uint256 conAmount = camp.targetAmount - camp.totalAmount;
+
+            (bool success,) = payable(msg.sender).call{value: _sum - conAmount}("");
+            require(success, "Crowdfunding: Transaction faild!");
+
+            _sum = conAmount;
+            camp.status = true;
+        }
+
         camp.totalAmount += _sum;
         backerToContribution[_campId][msg.sender] += _sum;
         idToCampaign[_campId] = camp;
@@ -95,16 +107,15 @@ contract Crowdfunding is Ownable{
     }
 
     /**
-     * @dev This function allow creator to claim all contributions if vesting period was over and the target reached.
+     * @dev This function allow creator to claim all contributions if the goal is met.
      * @param _campId The id of want campaign.
      */
     function claimContributions(uint256 _campId) external payable noReentrancy {
         require(_campId <= campaignId, "Crowdfunding: Invalid campaign id!");
         Campaign memory camp = idToCampaign[_campId];
+        require(camp.status, "Crowdfunding: Goal not achieved!");
         require(camp.creator == msg.sender, "Crowdfunding: Only creator can claim contributions!");
         require(!camp.claim, "Crowdfunding: Already claimed!");
-        require(camp.vestingPeriod <= block.timestamp, "Crowdfunding: Vesting period doesn't over!");
-        require(camp.targetAmount <= camp.totalAmount, "Crowdfunding: Goal not achieved!");
 
         uint256 claimAmount = camp.totalAmount;
         (bool success,) = payable(msg.sender).call{value: claimAmount}("");
@@ -116,16 +127,16 @@ contract Crowdfunding is Ownable{
     }
 
     /**
-     * @dev This function allow backers to claim tokens if vesting period was over and the target reached.
+     * @dev This function allow backers to claim tokens if the goal is met.
      * @param _campId The id of want campaign.
      */
     function claimTokens(uint256 _campId) external noReentrancy {
         require(_campId <= campaignId, "Crowdfunding: Invalid campaign id!");
         Campaign memory camp = idToCampaign[_campId];
-        require(camp.vestingPeriod <= block.timestamp, "Crowdfunding: Vesting period doesn't over!");
-        require(backerToContribution[_campId][msg.sender] > 0, "Crowdfunding: You aren't backer in this campaign id!");
+        require(camp.status || camp.vestingPeriod <= block.timestamp, "Crowdfunding: Goal not achieved!");
+        require(backerToContribution[_campId][msg.sender] > 0, "Crowdfunding: You aren't backer in this campaign or the contribution balance is 0!");
 
-        if(camp.targetAmount > camp.totalAmount) {
+        if(camp.totalAmount < camp.targetAmount) {
             _refundContributions(_campId);
         } else {
             _claimTokens(_campId);
@@ -135,7 +146,7 @@ contract Crowdfunding is Ownable{
     }
 
     /**
-     * @dev This function allow to transfer eth to backers, because the target didn't reached.
+     * @dev This function allow to transfer eth to backers, if the goal is not met.
      * @param _campId The id of want campaign.
      */
     function _refundContributions(uint256 _campId) private {
@@ -147,7 +158,7 @@ contract Crowdfunding is Ownable{
     }
 
     /**
-     * @dev This function allow to transfer tokens to backers, because the target reached.
+     * @dev This function allow to transfer tokens to backers, the goal is achieved.
      * @param _campId The id of want campaign.
      */
     function _claimTokens(uint256 _campId) private {
@@ -161,10 +172,10 @@ contract Crowdfunding is Ownable{
      * @dev This function allows you to get the contribution balance, if any.
      * @param _campId The id of want campaign.
      */
-    function getContributionBalances(uint256 _campId) external view returns(uint256) {
+    function getContributionBalances(uint256 _campId, address _backer) external view returns(uint256) {
         require(_campId <= campaignId, "Crowdfunding: Invalid campaign id!");
-        uint256 balance = backerToContribution[_campId][msg.sender];
-        require(balance > 0, "Crowdfunding: You aren't backer in this campaign id!");
+        require(msg.sender == _backer || msg.sender == idToCampaign[_campId].creator, "Crowdfunding: You aren't backer in this campaign or the contribution balance is 0!");
+        uint256 balance = backerToContribution[_campId][_backer];
 
         return balance;
     }
@@ -184,4 +195,24 @@ contract Crowdfunding is Ownable{
     function getContributionForExatTokens(uint256 _amount) external view returns(uint256) {
         return _amount * ratio;
     }
+
+    /**
+     * @dev This function allow to get campaign info.
+     * @param _campId The want campaign id
+     */
+    function getCampaignInfo(uint256 _campId) external view returns(Campaign memory) {
+        Campaign memory camp = idToCampaign[_campId];
+
+        return Campaign(
+            camp.name, 
+            camp.goal, 
+            camp.targetAmount, 
+            camp.creator, 
+            camp.vestingPeriod,
+            camp.totalAmount,
+            camp.claim,
+            camp.status
+        );
+    }
 }
+
